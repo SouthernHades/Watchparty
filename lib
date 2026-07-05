@@ -1,0 +1,238 @@
+/**
+ * Formats a date to Eastern Time with "ET" suffix
+ * Handles both EST and EDT automatically
+ */
+export function formatToET(date: Date | string): string {
+  const d = typeof date === "string" ? new Date(date) : date
+  
+  return d.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }) + " ET"
+}
+
+/**
+ * Formats just the time portion in Eastern Time
+ */
+export function formatTimeOnlyET(date: Date | string): string {
+  const d = typeof date === "string" ? new Date(date) : date
+  
+  return d.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }) + " ET"
+}
+
+/**
+ * Gets today's date string in Eastern Time (for comparison)
+ */
+export function getTodayET(): string {
+  return new Date().toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  })
+}
+
+/**
+ * Checks if a date is today in Eastern Time
+ */
+export function isTodayET(date: Date | string): boolean {
+  const d = typeof date === "string" ? new Date(date) : date
+  const dateString = d.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  })
+  return dateString === getTodayET()
+}
+
+/**
+ * Formats a UTC date to the user's LOCAL timezone (not hardcoded ET)
+ * Shows "Today at 3:30 PM" or "May 10 at 7:30 PM" with their local timezone
+ */
+export function formatSmartET(date: Date | string): string {
+  const d = typeof date === "string" ? new Date(date) : date
+  
+  // Get user's local timezone without hardcoding ET
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZoneName: "short",
+  })
+  
+  const time = formatter.format(d)
+  
+  // Check if date is today by comparing in user's local timezone
+  const today = new Date()
+  const dateInLocal = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: undefined, // Use browser's local timezone
+  }).format(d)
+  
+  const todayStr = new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(today)
+  
+  if (dateInLocal === todayStr) {
+    return `Today at ${time}`
+  }
+  
+  const dateStr = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+  }).format(d)
+  
+  return `${dateStr} at ${time}`
+}
+
+/**
+ * Format live game status for display
+ * Shows inning/quarter/period with score
+ */
+export function formatLiveStatus(liveDetails: {
+  period?: number
+  detail?: string
+  shortDetail?: string
+  homeScore?: string
+  awayScore?: string
+  homeTeam?: string
+  awayTeam?: string
+  displayClock?: string
+} | null, category: string): string | null {
+  if (!liveDetails) return null
+  
+  const { detail, shortDetail, homeScore, awayScore, homeTeam, awayTeam, displayClock, period } = liveDetails
+  
+  // Build score string if available
+  let scoreStr = ""
+  if (awayScore !== undefined && homeScore !== undefined && awayTeam && homeTeam) {
+    scoreStr = `${awayTeam} ${awayScore} - ${homeTeam} ${homeScore}`
+  }
+  
+  // Use detail or shortDetail for period info
+  const periodInfo = shortDetail || detail || ""
+  
+  if (periodInfo && scoreStr) {
+    return `${periodInfo} | ${scoreStr}`
+  }
+  if (periodInfo) {
+    return periodInfo
+  }
+  
+  // Fallback based on category
+  if (category === "baseball" && period) {
+    const inningStr = `Inning ${period}`
+    return scoreStr ? `${inningStr} | ${scoreStr}` : inningStr
+  }
+  if (category === "basketball" && period) {
+    const qStr = `Q${period}${displayClock ? ` ${displayClock}` : ""}`
+    return scoreStr ? `${qStr} | ${scoreStr}` : qStr
+  }
+  if (category === "football" && period) {
+    const qStr = `Q${period}${displayClock ? ` ${displayClock}` : ""}`
+    return scoreStr ? `${qStr} | ${scoreStr}` : qStr
+  }
+  if (category === "hockey" && period) {
+    const pStr = `P${period}${displayClock ? ` ${displayClock}` : ""}`
+    return scoreStr ? `${pStr} | ${scoreStr}` : pStr
+  }
+  if (category === "soccer" && displayClock) {
+    return scoreStr ? `${displayClock}' | ${scoreStr}` : `${displayClock}'`
+  }
+  
+  return scoreStr || null
+}
+
+import { createBrowserClient } from '@supabase/ssr'
+
+export function createClient() {
+  return createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+  )
+}
+
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function updateSession(request: NextRequest) {
+  let supabaseResponse = NextResponse.next({
+    request,
+  })
+
+  // With Fluid compute, don't put this client in a global environment
+  // variable. Always create a new one on each request.
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll()
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) =>
+            request.cookies.set(name, value),
+          )
+          supabaseResponse = NextResponse.next({
+            request,
+          })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            supabaseResponse.cookies.set(name, value, options),
+          )
+        },
+      },
+    },
+  )
+
+  // Do not run code between createServerClient and
+  // supabase.auth.getUser(). A simple mistake could make it very hard to debug
+  // issues with users being randomly logged out.
+
+  // IMPORTANT: If you remove getUser() and you use server-side rendering
+  // with the Supabase client, your users may be randomly logged out.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  if (
+    // if the user is not logged in and the app path, in this case, /protected, is accessed, redirect to the login page
+    request.nextUrl.pathname.startsWith('/protected') &&
+    !user
+  ) {
+    // no user, potentially respond by redirecting the user to the login page
+    const url = request.nextUrl.clone()
+    url.pathname = '/auth/login'
+    return NextResponse.redirect(url)
+  }
+
+  // IMPORTANT: You *must* return the supabaseResponse object as it is.
+  // If you're creating a new response object with NextResponse.next() make sure to:
+  // 1. Pass the request in it, like so:
+  //    const myNewResponse = NextResponse.next({ request })
+  // 2. Copy over the cookies, like so:
+  //    myNewResponse.cookies.setAll(supabaseResponse.cookies.getAll())
+  // 3. Change the myNewResponse object to fit your needs, but avoid changing
+  //    the cookies!
+  // 4. Finally:
+  //    return myNewResponse
+  // If this is not done, you may be causing the browser and server to go out
+  // of sync and terminate the user's session prematurely!
+
+  return supabaseResponse
+}
