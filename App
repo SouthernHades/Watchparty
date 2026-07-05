@@ -1,0 +1,475 @@
+import { createClient } from "@supabase/supabase-js"
+import { NextResponse } from "next/server"
+import { subMinutes, addDays, format, isBefore, isAfter, parseISO } from "date-fns"
+
+// Runs every 5 minutes via Vercel cron to keep event statuses accurate (no date-fns-tz needed)
+// and auto-open rooms exactly 10 minutes before game time.
+
+const LEAGUES = [
+  // Football
+  { id: "nfl",  name: "NFL",  sport: "football",   category: "sports", sportCategory: "football" },
+  { id: "college-football", name: "NCAAF", sport: "football", category: "sports", sportCategory: "football" },
+  // Basketball
+  { id: "nba",  name: "NBA",  sport: "basketball", category: "sports", sportCategory: "basketball" },
+  { id: "wnba", name: "WNBA", sport: "basketball", category: "sports", sportCategory: "basketball" },
+  { id: "mens-college-basketball", name: "NCAAM", sport: "basketball", category: "sports", sportCategory: "basketball" },
+  // Baseball
+  { id: "mlb",  name: "MLB",  sport: "baseball",   category: "sports", sportCategory: "baseball" },
+  // Hockey
+  { id: "nhl",  name: "NHL",  sport: "hockey",     category: "sports", sportCategory: "hockey" },
+  // UFC/MMA
+  { id: "ufc",  name: "UFC",  sport: "mma",        category: "sports", sportCategory: "ufc" },
+  // Soccer
+  { id: "usa.1", name: "MLS",  sport: "soccer",   category: "sports", sportCategory: "soccer" },
+  { id: "eng.1", name: "EPL",  sport: "soccer",   category: "sports", sportCategory: "soccer" },
+  { id: "uefa.champions", name: "Champions League", sport: "soccer", category: "sports", sportCategory: "soccer" },
+  // Golf
+  { id: "pga",  name: "PGA Tour",  sport: "golf",   category: "sports", sportCategory: "golf" },
+]
+
+// ESPN scoreboard supports a date range: ?dates=YYYYMMDD-YYYYMMDD
+function buildScoreboardUrl(sport: string, league: string, fromDate: Date, toDate: Date) {
+  const from = format(fromDate, "yyyyMMdd")
+  const to   = format(toDate,   "yyyyMMdd")
+  return `https://site.api.espn.com/apis/site/v2/sports/${sport}/${league}/scoreboard?dates=${from}-${to}&limit=100`
+}
+
+interface ESPNCompetitor {
+  homeAway: "home" | "away"
+  team: { displayName: string; abbreviation: string }
+}
+
+interface ESPNEvent {
+  id: string
+  date: string
+  name: string
+  status: { 
+    type: { name: string; completed: boolean; detail?: string; shortDetail?: string }
+    period?: number
+    displayClock?: string
+  }
+  competitions: Array<{
+    competitors: ESPNCompetitor[]
+  }>
+}
+
+interface LiveDetails {
+  period?: number          // Inning, quarter, period, round, etc.
+  displayClock?: string    // "3:45" remaining in quarter, etc.
+  detail?: string          // "Bottom 8th", "4th Quarter", etc.
+  shortDetail?: string     // "Bot 8th", "Q4", etc.
+  homeScore?: string
+  awayScore?: string
+  homeTeam?: string
+  awayTeam?: string
+}
+
+function buildLiveDetails(event: ESPNEvent): LiveDetails | null {
+  const competitors = event.competitions?.[0]?.competitors ?? []
+  const home = competitors.find((c) => c.homeAway === "home")
+  const away = competitors.find((c) => c.homeAway === "away")
+  
+  // Only include details for in-progress games
+  const espnStatus = event.status.type.name
+  if (espnStatus !== "STATUS_IN_PROGRESS" && espnStatus !== "STATUS_HALFTIME" && espnStatus !== "STATUS_END_PERIOD") {
+    return null
+  }
+
+  return {
+    period: event.status.period,
+    displayClock: event.status.displayClock,
+    detail: event.status.type.detail,
+    shortDetail: event.status.type.shortDetail,
+    homeScore: (home as any)?.score,
+    awayScore: (away as any)?.score,
+    homeTeam: home?.team?.abbreviation,
+    awayTeam: away?.team?.abbreviation,
+  }
+}
+
+interface ESPNResponse {
+  events?: ESPNEvent[]
+}
+
+function buildTitle(event: ESPNEvent): string {
+  const competitors = event.competitions?.[0]?.competitors ?? []
+  if (competitors.length === 2) {
+    const away = competitors.find((c) => c.homeAway === "away")
+    const home = competitors.find((c) => c.homeAway === "home")
+    if (away && home) {
+      return `${away.team.displayName} at ${home.team.displayName}`
+    }
+  }
+  // Fallback to ESPN's own name field
+  return event.name
+}
+
+function resolveStatus(
+  event: ESPNEvent,
+  startsAt: Date,
+  roomOpensAt: Date,
+  now: Date
+): "scheduled" | "open" | "live" | "ended" {
+  const espnStatus = event.status.type.name
+
+  // Always trust ESPN's completion flag first
+  if (espnStatus === "STATUS_FINAL" || espnStatus === "STATUS_FULL_TIME" || event.status.type.completed) return "ended"
+  if (espnStatus === "STATUS_IN_PROGRESS" || espnStatus === "STATUS_HALFTIME" || espnStatus === "STATUS_END_PERIOD") return "live"
+
+  // If start time was more than 4 hours ago and not marked in-progress, assume ended
+  const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000)
+  if (isBefore(startsAt, fourHoursAgo)) return "ended"
+
+  // Room opens 10 min before start
+  if (isBefore(roomOpensAt, now) && isAfter(startsAt, now)) return "open"
+  if (isBefore(now, roomOpensAt)) return "scheduled"
+
+  // Start time just passed but ESPN hasn't updated yet — treat as live
+  return "live"
+}
+
+export async function GET(request: Request) {
+  // Protect the endpoint in production
+  const authHeader = request.headers.get("authorization")
+  if (process.env.NODE_ENV === "production") {
+    if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+  }
+
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+  if (!supabaseUrl || !supabaseServiceKey) {
+    return NextResponse.json({ error: "Missing Supabase env vars" }, { status: 500 })
+  }
+
+  // Service role key bypasses RLS — required for server-side upserts
+  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+
+  const now      = new Date()
+  const nextWeek = addDays(now, 7)
+  const summary: { league: string; fetched: number; upserted: number; errors: string[] }[] = []
+
+  // ─── 1. Fetch & upsert upcoming/live events from ESPN ─────────────────────
+  for (const league of LEAGUES) {
+    const errors: string[] = []
+    let fetched  = 0
+    let upserted = 0
+
+    try {
+      const url = buildScoreboardUrl(league.sport, league.id, now, nextWeek)
+      const res = await fetch(url, { next: { revalidate: 0 } })
+
+      if (!res.ok) {
+        summary.push({ league: league.name, fetched: 0, upserted: 0, errors: [`HTTP ${res.status}`] })
+        continue
+      }
+
+      const data: ESPNResponse = await res.json()
+      const events = data.events ?? []
+      fetched = events.length
+
+      for (const event of events) {
+        const startsAt    = parseISO(event.date)
+        const roomOpensAt = subMinutes(startsAt, 10)
+        const status      = resolveStatus(event, startsAt, roomOpensAt, now)
+        const title       = buildTitle(event)
+        const liveDetails = buildLiveDetails(event)
+
+        const { error } = await supabase.from("events").upsert(
+          {
+            external_id:   `espn_${league.id}_${event.id}`,
+            source:        "espn",
+            title,
+            category:      league.sportCategory, // basketball, baseball, ufc, soccer, golf, football
+            subcategory:   league.name,          // NBA, MLB, UFC, MLS, PGA Tour, etc.
+            starts_at:     startsAt.toISOString(),
+            room_opens_at: roomOpensAt.toISOString(),
+            status,
+            live_details:  liveDetails,
+          },
+          { onConflict: "external_id", ignoreDuplicates: false }
+        )
+
+        if (error) {
+          errors.push(error.message)
+        } else {
+          upserted++
+        }
+      }
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err))
+    }
+
+    summary.push({ league: league.name, fetched, upserted, errors })
+  }
+
+  // ─── 2. Sync manual reality TV shows (Survivor, Bachelor, etc.) ────────────
+  // These are scheduled for specific times — add them as manual events
+  const manualShows = [
+    // Survivor - Wednesdays at 8 PM ET (we'll create upcoming episodes)
+    {
+      title: "Survivor Season 47",
+      subcategory: "Survivor",
+      dayOfWeek: 3, // Wednesday (0=Sunday, 3=Wednesday)
+      time: "20:00", // 8 PM ET
+    },
+    // Bachelor/Bachelorette - Mondays at 8 PM ET
+    {
+      title: "The Bachelor Season 29",
+      subcategory: "Bachelor",
+      dayOfWeek: 1, // Monday
+      time: "20:00",
+    },
+  ]
+
+  for (const show of manualShows) {
+    try {
+      // Find upcoming air dates for this show (next 10 instances)
+      let checkDate = new Date(now)
+      const airDates: Date[] = []
+
+      for (let i = 0; i < 10 && airDates.length < 10; i++) {
+        if (checkDate.getDay() === show.dayOfWeek && checkDate > now) {
+          const [hours, minutes] = show.time.split(":").map(Number)
+          
+          // Create date with ET time (accounting for daylight saving)
+          // Convert ET time to UTC by constructing as if it's UTC then adjusting
+          const year = checkDate.getFullYear()
+          const month = checkDate.getMonth()
+          const day = checkDate.getDate()
+          
+          // Create as UTC initially
+          const utcDate = new Date(Date.UTC(year, month, day, hours, minutes, 0))
+          
+          // Get the offset for Eastern Time on this date
+          // Create a date string and use Intl.DateTimeFormat to get the offset
+          const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'America/New_York',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+          })
+          
+          // The difference between ET and UTC varies (EST is -5, EDT is -4)
+          // We need to find what offset applies on this date
+          const testDate = new Date(year, month, day, hours, minutes, 0)
+          const parts = formatter.formatToParts(testDate)
+          const etYear = parseInt(parts.find(p => p.type === 'year')?.value || '0')
+          const etMonth = parseInt(parts.find(p => p.type === 'month')?.value || '0') - 1
+          const etDay = parseInt(parts.find(p => p.type === 'day')?.value || '0')
+          const etHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0')
+          
+          // Get UTC time of midnight ET on this date
+          const midnightET = new Date(year, month, day, 0, 0, 0)
+          const midnightUTC = new Date(midnightET.toLocaleString('en-US', { timeZone: 'UTC' }))
+          const offsetMs = midnightET.getTime() - midnightUTC.getTime()
+          
+          // Convert ET time to UTC
+          const episodeDate = new Date(testDate.getTime() - offsetMs)
+
+          if (episodeDate > now) {
+            airDates.push(episodeDate)
+          }
+        }
+        checkDate.setDate(checkDate.getDate() + 1)
+      }
+
+      // Upsert each upcoming episode
+      for (const airDate of airDates) {
+        const roomOpensAt = subMinutes(airDate, 10)
+        const status = resolveStatus(
+          {
+            id: "",
+            date: airDate.toISOString(),
+            name: show.title,
+            status: { type: { name: "STATUS_SCHEDULED", completed: false } },
+            competitions: [],
+          },
+          airDate,
+          roomOpensAt,
+          now
+        )
+
+        await supabase.from("events").upsert(
+          {
+            external_id:   `manual_${show.subcategory}_${airDate.getTime()}`,
+            source:        "manual",
+            title:         show.title,
+            category:      "reality",
+            subcategory:   show.subcategory,
+            starts_at:     airDate.toISOString(),
+            room_opens_at: roomOpensAt.toISOString(),
+            status,
+          },
+          { onConflict: "external_id", ignoreDuplicates: false }
+        )
+      }
+    } catch (err) {
+      console.error(`Error syncing ${show.title}:`, err)
+    }
+  }
+
+  // ─── 3. Status transitions for ALL events ─────────────────────────────────
+  // scheduled → open  (room_opens_at has passed, game hasn't started yet)
+  await supabase
+    .from("events")
+    .update({ status: "open" })
+    .eq("status", "scheduled")
+    .lte("room_opens_at", now.toISOString())
+    .gt("starts_at", now.toISOString())
+
+  // scheduled/open → live  (game start time has passed)
+  await supabase
+    .from("events")
+    .update({ status: "live" })
+    .in("status", ["scheduled", "open"])
+    .lte("starts_at", now.toISOString())
+
+  // live/open/scheduled → ended  (started more than 4 hours ago = definitely over)
+  const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000)
+  await supabase
+    .from("events")
+    .update({ status: "ended" })
+    .in("status", ["live", "open", "scheduled"])
+    .lt("starts_at", fourHoursAgo.toISOString())
+
+  // ─── 4. Delete stale events older than 48 hours so they don't pile up ─────
+  const twoDaysAgo = new Date(now.getTime() - 48 * 60 * 60 * 1000)
+  await supabase
+    .from("events")
+    .delete()
+    .lt("starts_at", twoDaysAgo.toISOString())
+
+  return NextResponse.json({
+    success:   true,
+    timestamp: now.toISOString(),
+    nextWeek:  nextWeek.toISOString(),
+    summary,
+  })
+}
+
+import { createClient } from "@supabase/supabase-js"
+import { NextResponse } from "next/server"
+import { addMinutes, addHours, subMinutes, addDays } from "date-fns"
+
+// Seed endpoint to populate sample events for testing
+// Only accessible in development
+
+const SAMPLE_EVENTS = [
+  // Live now
+  { title: "Lakers vs Celtics", category: "sports", subcategory: "NBA", hoursOffset: -1, status: "live" },
+  { title: "The Bachelor Season 28 Episode 5", category: "reality", subcategory: "Bachelor", hoursOffset: -0.5, status: "live" },
+  
+  // Room open (starting soon)
+  { title: "49ers vs Cowboys", category: "sports", subcategory: "NFL", hoursOffset: 0.1, status: "open" },
+  { title: "Survivor Season 47 Episode 10", category: "reality", subcategory: "Survivor", hoursOffset: 0.15, status: "open" },
+  
+  // Upcoming (scheduled)
+  { title: "Yankees vs Red Sox", category: "sports", subcategory: "MLB", hoursOffset: 2, status: "scheduled" },
+  { title: "Golden Knights vs Bruins", category: "sports", subcategory: "NHL", hoursOffset: 4, status: "scheduled" },
+  { title: "The Voice Live Finale", category: "reality", subcategory: "The Voice", hoursOffset: 6, status: "scheduled" },
+  { title: "Oscar Awards 2026", category: "awards", subcategory: "Oscars", hoursOffset: 24, status: "scheduled" },
+  { title: "Heat vs Nuggets", category: "sports", subcategory: "NBA", hoursOffset: 48, status: "scheduled" },
+  { title: "Love Island Episode 15", category: "reality", subcategory: "Love Island", hoursOffset: 72, status: "scheduled" },
+]
+
+export async function POST() {
+  // Only allow in development
+  if (process.env.NODE_ENV === "production") {
+    return NextResponse.json({ error: "Not available in production" }, { status: 403 })
+  }
+
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+  if (!supabaseUrl || !supabaseServiceKey) {
+    return NextResponse.json({ error: "Missing Supabase credentials" }, { status: 500 })
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseServiceKey)
+  const now = new Date()
+
+  const events = SAMPLE_EVENTS.map((event, index) => {
+    const startsAt = addMinutes(now, event.hoursOffset * 60)
+    const roomOpensAt = subMinutes(startsAt, 10)
+    
+    return {
+      external_id: `seed_${index}_${Date.now()}`,
+      source: "manual",
+      title: event.title,
+      category: event.category,
+      subcategory: event.subcategory,
+      starts_at: startsAt.toISOString(),
+      room_opens_at: roomOpensAt.toISOString(),
+      status: event.status,
+    }
+  })
+
+  const { data, error } = await supabase.from("events").insert(events).select()
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+
+  return NextResponse.json({
+    success: true,
+    message: `Seeded ${data.length} events`,
+    events: data,
+  })
+}
+
+import { createClient } from '@/lib/supabase/server'
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function GET(request: NextRequest) {
+  const { searchParams, origin } = request.nextUrl
+  const code = searchParams.get('code')
+  const next = searchParams.get('next') ?? '/'
+
+  if (code) {
+    const supabase = await createClient()
+    const { error } = await supabase.auth.exchangeCodeForSession(code)
+    if (!error) {
+      return NextResponse.redirect(`${origin}${next}`)
+    }
+  }
+
+  return NextResponse.redirect(`${origin}/auth/error`)
+}
+
+import Link from "next/link"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+
+export default function AuthErrorPage() {
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4 bg-muted/30">
+      <Card className="w-full max-w-md text-center">
+        <CardHeader>
+          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-destructive/20">
+            <svg className="h-8 w-8 text-destructive" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+          </div>
+          <CardTitle className="text-2xl">Authentication Error</CardTitle>
+          <CardDescription>
+            Something went wrong during authentication. This could be an expired link or an invalid request.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <Button asChild>
+            <Link href="/auth/login">Try Again</Link>
+          </Button>
+          <Button variant="outline" asChild>
+            <Link href="/">Return to Home</Link>
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
